@@ -1,0 +1,273 @@
+import argparse
+import torch
+
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.conversation import conv_templates, SeparatorStyle
+from llava.model.builder import load_pretrained_model
+from llava.utils import disable_torch_init
+from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria
+
+from PIL import Image
+
+import requests
+from PIL import Image
+from io import BytesIO
+from transformers import TextStreamer
+import cv2
+import numpy as np
+from tqdm import tqdm
+import os
+import pickle
+import json
+
+def load_image(image_file):
+    if image_file.startswith('http://') or image_file.startswith('https://'):
+        response = requests.get(image_file)
+        image = Image.open(BytesIO(response.content)).convert('RGB')
+    else:
+        image = Image.open(image_file).convert('RGB')
+    return image
+
+## plot bbox on image
+def plot_bbox(image, bbox):
+    bbox = bbox.astype(np.int)
+    # image = cv2.rectangle(image, (bbox[0], bbox[1]), (bbox[0]+bbox[2], bbox[1]+bbox[3]), (0,255,0), 2)
+    image = cv2.rectangle(image, (bbox[0], bbox[1]), (bbox[0]+bbox[2], bbox[1]+bbox[3]), (0,0,255), 2)
+    return image
+
+def main(args):
+    # Model
+    disable_torch_init()
+
+    model_name = get_model_name_from_path(args.model_path)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, args.model_base, model_name, args.load_8bit, args.load_4bit, device=args.device)
+
+    if 'llama-2' in model_name.lower():
+        conv_mode = "llava_llama_2"
+    elif "v1" in model_name.lower():
+        conv_mode = "llava_v1"
+    elif "mpt" in model_name.lower():
+        conv_mode = "mpt"
+    else:
+        conv_mode = "llava_v0"
+
+    if args.conv_mode is not None and conv_mode != args.conv_mode:
+        print('[WARNING] the auto inferred conversation mode is {}, while `--conv-mode` is {}, using {}'.format(conv_mode, args.conv_mode, args.conv_mode))
+    else:
+        args.conv_mode = conv_mode
+
+    # conv = conv_templates[args.conv_mode].copy()
+    # if "mpt" in model_name.lower():
+    #     roles = ('user', 'assistant')
+    # else:
+    #     roles = conv.roles
+
+    # from time import time
+    # image = load_image(args.image_file)
+    # Similar operation in model_worker.py
+    # image_tensor = process_images([image], image_processor, args)
+    # if type(image_tensor) is list:
+    #     image_tensor = [image.to(model.device, dtype=torch.float16) for image in image_tensor]
+    # else:
+    #     image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+    if args.dataset == '4dhumans':
+        datafolder = '/fast/yfeng/Projects/GPT/HumanGPT/dataset/humangpt/4dhumans'
+    elif args.dataset == 'bedlam':
+        datafolder = '/fast/yfeng/Projects/GPT/HumanGPT/dataset/humangpt/bedlam'
+    
+    # savefolder = os.path.join(datafolder, 'llava')
+    savefolder_highlight = os.path.join(datafolder, 'input_image_highlight')
+    savefolder_pure = os.path.join(datafolder, 'input_image')
+    os.makedirs(savefolder_highlight, exist_ok=True)
+    os.makedirs(savefolder_pure, exist_ok=True)
+    
+    valid_list = []
+    question_dict = {
+        "pose": "There is a person in the middle of the image, describe what he/she is doing. The answer starts with \"The person\"", # high level human pose
+        "pose_detail": "There is a person in the middle of the image, describe the detailed pose of his torso, left and right arms, hands, legs and feets, use short sentences. The answer starts with \"The person\"", # detailed human pose
+        "appearance": "Describe how the person in the center of the image look like. The answer starts with \"The person\"", # human appearance
+        # "env":"Describe the space relations of the person and the environment. The answer starts with \"The person\"", # background
+    }
+    
+    from glob import glob
+    imagepath_list = glob(os.path.join(datafolder, 'cropped_image', '*.png')) 
+    imagepath_list = sorted(imagepath_list)
+    ### split image list into batches
+    imagepath_list = imagepath_list[args.batch_idx * args.batch_size: (args.batch_idx + 1) * args.batch_size]
+    
+    
+    for i in tqdm(range(len(imagepath_list))):
+        ## load cropped image
+        imagepath = imagepath_list[i]
+        imagename = imagepath.split('/')[-1].split('.')[0]
+        
+        ## load full image and bbox, check if bbox size is 60% of the full image
+        if args.dataset == '4dhumans':
+            full_imgpath = os.path.join(datafolder, 'full_image', imagename + '.png')
+        elif args.dataset == 'bedlam':
+            full_imgpath = os.path.join(datafolder, 'full_image', imagename + '.txt')
+            with open(full_imgpath, 'r') as f:
+                full_imgpath = f.readline().strip()
+            if not os.path.exists(full_imgpath):
+                print('full image not exist, skip')
+                continue
+        image = cv2.imread(full_imgpath)
+        size = image.shape[:2]
+        ## plot bbox on image
+        # read smpl parameters
+        with open(os.path.join(datafolder, 'smpl_params', imagename + '.pkl'), 'rb') as f:
+            smpl_dict = pickle.load(f)
+        orig_keypoints_2d = smpl_dict['orig_keypoints_2d']
+        bbox = np.array([np.min(orig_keypoints_2d[:, 0]), np.min(orig_keypoints_2d[:, 1]), np.max(orig_keypoints_2d[:, 0]) - np.min(orig_keypoints_2d[:, 0]), np.max(orig_keypoints_2d[:, 1]) - np.min(orig_keypoints_2d[:, 1])])        
+        # bbox = np.loadtxt(os.path.join(datafolder, 'bbox', imagename + '.txt'))
+        ## crop image if bbox size is too small
+        bbox = bbox.astype(np.int)
+        
+        ## center crop the image and adapt bbox
+        if max(bbox[-1],bbox[-2]) < 0.4 * min(size):
+            print('bbox size is too small, skip')
+            continue
+            bbox_size = min(size)*np.random.uniform(0.7, 1.)
+            bbox_size = int(bbox_size)
+            
+        bbox_size = min(size)
+        center_bbox = np.array([size[1]//2, size[0]//2, bbox_size, bbox_size])
+        center_bbox = center_bbox.astype(np.int)
+        # check if center_box contains bbox, if not,continue
+        if bbox[0] < center_bbox[0]-center_bbox[2]//2 or bbox[0]+bbox[2] > center_bbox[0]+center_bbox[2]//2 or bbox[1] < center_bbox[1]-center_bbox[3]//2 or bbox[1]+bbox[3] > center_bbox[1]+center_bbox[3]//2:
+            print('center bbox does not contain bbox, skip')
+            continue
+        # space = 40
+        # if bbox[0] < center_bbox[0]-center_bbox[2]//2:
+        #     center_bbox[0] = bbox[0] + center_bbox[2]//2 + space
+        # elif bbox[0] > center_bbox[0]+center_bbox[2]//2:
+        #     center_bbox[0] = bbox[0] - center_bbox[2]//2 - space
+        # if bbox[1] < center_bbox[1]-center_bbox[3]//2:
+        #     center_bbox[1] = bbox[1] + center_bbox[3]//2 + space
+        # elif bbox[1] > center_bbox[1]+center_bbox[3]//2:
+        #     center_bbox[1] = bbox[1] - center_bbox[3]//2 - space
+        
+        # check if center_bbox is out of image,  if yes, continue
+        if center_bbox[0]-center_bbox[2]//2 < 0 or center_bbox[0]+center_bbox[2]//2 > size[1] or center_bbox[1]-center_bbox[3]//2 < 0 or center_bbox[1]+center_bbox[3]//2 > size[0]:
+            print('center bbox out of image, skip')
+            continue
+        
+        image = image[center_bbox[1]-center_bbox[3]//2:center_bbox[1]+center_bbox[3]//2, center_bbox[0]-center_bbox[2]//2:center_bbox[0]+center_bbox[2]//2, :]
+        # crop image and adapt bbox
+        bbox[0] = bbox[0] - center_bbox[0] + center_bbox[2]//2
+        bbox[1] = bbox[1] - center_bbox[1] + center_bbox[3]//2
+        
+        
+        # if max(bbox[-1],bbox[-2]) < 0.5 * min(size):
+        #     continue
+        #     print('bbox size is too small, crop image')
+        #     scale = min(size)/max(bbox[-1],bbox[-2]) * 0.5
+        #     new_height = int(size[0] * scale)
+        #     new_width = int(size[1] * scale)
+            
+        #     ## crop image
+        #     new_bbox = np.array([bbox[0], bbox[1], new_width, new_height])
+        #     new_bbox = new_bbox.astype(np.int)
+        #     image = image[new_bbox[1]-new_bbox[3]//2:new_bbox[1]+new_bbox[3]//2, new_bbox[0]-new_bbox[2]//2:new_bbox[0]+new_bbox[2]//2, :]
+        
+        cv2.imwrite(os.path.join(savefolder_pure, imagename + '.png'), image)
+        image = plot_bbox(image, bbox)
+        cv2.imwrite(os.path.join(savefolder_highlight, imagename + '.png'), image)
+        print('save image: ', os.path.join(savefolder_highlight, imagename + '.png')) 
+        valid_list.append(imagename)
+        continue
+        
+        valid_list.append(imagename)
+        
+        ## run LLaVA on cropped image
+        image = load_image(imagepath)
+        image_tensor = process_images([image], image_processor, args)
+        if type(image_tensor) is list:
+            image_tensor = [image.to(model.device, dtype=torch.float16) for image in image_tensor]
+        else:
+            image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+
+        outputs_dict = {}
+        for key, question in question_dict.items():
+            conv = conv_templates[args.conv_mode].copy()
+            if "mpt" in model_name.lower():
+                roles = ('user', 'assistant')
+            else:
+                roles = conv.roles
+
+            inp = question
+            if image is not None:
+                # first message
+                if model.config.mm_use_im_start_end:
+                    inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + inp
+                else:
+                    inp = DEFAULT_IMAGE_TOKEN + '\n' + inp
+                conv.append_message(conv.roles[0], inp)
+                # image = None
+            else:
+                # later messages
+                conv.append_message(conv.roles[0], inp)
+            conv.append_message(conv.roles[1], None)
+            prompt = conv.get_prompt()
+
+            input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(model.device)
+            stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+            keywords = [stop_str]
+            stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+            streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+            # import ipdb; ipdb.set_trace()
+            with torch.inference_mode():
+                output_ids = model.generate(
+                    input_ids,
+                    images=image_tensor,
+                    do_sample=True,
+                    temperature=args.temperature,
+                    max_new_tokens=args.max_new_tokens,
+                    # streamer=streamer,
+                    use_cache=False) #,
+                    # stopping_criteria=[stopping_criteria])
+            
+            outputs = tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip().replace("</s>", "")
+            # print(key, '\n', outputs)
+            outputs_dict[key] = outputs
+        #-------- saving results
+        # save dict to json
+        with open(os.path.join(savefolder, imagename + '.json'), 'w') as f:
+            json.dump(outputs_dict, f)
+        
+        # import ipdb; ipdb.set_trace()
+    # save the valid list
+    # with open(os.path.join(datafolder, 'valid_list.txt'), 'w') as f:
+    #     for item in valid_list:
+    #         f.write("%s\n" % item)
+    print('done')
+    print(f'valid number: {len(valid_list)}')        
+    
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="4dhumans")
+    # parser.add_argument("--dataset", type=str, default="bedlam")
+    parser.add_argument("--batch_size", type=int, default=500)
+    parser.add_argument("--batch_idx", type=int, default=0)
+    # parser.add_argument("--max-example", type=int, default=512)
+    parser.add_argument("--model-path", type=str, default="facebook/opt-350m")
+    parser.add_argument("--model-base", type=str, default=None)
+    parser.add_argument("--image-file", type=str, required=True)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--conv-mode", type=str, default=None)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--load-8bit", action="store_true")
+    parser.add_argument("--load-4bit", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--image-aspect-ratio", type=str, default='pad')
+    args = parser.parse_args()
+    main(args)
+
+
+'''
+python -m llava.serve.cli_bedlam \
+    --model-path liuhaotian/llava-v1.5-13b \
+    --image-file "https://llava-vl.github.io/static/images/view.jpg" \
+'''

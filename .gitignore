@@ -1,0 +1,52 @@
+# Compiled source #
+###################
+*.o
+*.so
+
+# Packages #
+############
+# it's better to unpack these files and commit the raw source
+# git has its own built in compression methods
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# OS generated files #
+######################
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.vscode
+
+# 3D data #
+############
+*.mat
+*.pkl
+*.obj
+*.dat
+*.npz
+
+# python file #
+############
+*.pyc
+__pycache__
+
+*results*
+# *_vis.jpg
+## internal use
+checkpoints
+data
+submodules
+vis_output
+main_test.py
+main_train.py
+main_val.py
